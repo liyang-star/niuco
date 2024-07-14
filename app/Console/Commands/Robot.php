@@ -3,9 +3,14 @@
 namespace App\Console\Commands;
 
 use App\AccountLog;
-use App\TransactionComplete;
+use App\Currency;
+use App\CurrencyMatch;
+use App\Jobs\SendMarket;
+use App\MarketHour;
+use App\MyQuotation;
+use App\RobotPlan;
+use App\Setting;
 use App\Transaction;
-use App\UserChat;
 use App\TransactionIn;
 use App\TransactionOut;
 use App\Users;
@@ -14,10 +19,8 @@ use Faker\Factory;
 use Illuminate\Console\Command;
 use App\Robot as RobotModel;
 use Illuminate\Support\Facades\Log;
-
-defined('ACCOUNT_ID') or define('ACCOUNT_ID', '50154012'); // 你的账户ID
-defined('ACCESS_KEY') or define('ACCESS_KEY', 'c96392eb-b7c57373-f646c2ef-25a14'); // 你的ACCESS_KEY
-defined('SECRET_KEY') or define('SECRET_KEY', ''); // 你的SECRET_KEY
+use Illuminate\Support\Facades\Redis;
+use App\Jobs\UpdateCurrencyPrice;
 
 class Robot extends Command
 {
@@ -26,7 +29,7 @@ class Robot extends Command
      *
      * @var string
      */
-   protected $signature = 'robot {id} {--mode=}';
+    protected $signature = 'robot {id}';
 
     /**
      * The console command description.
@@ -58,9 +61,31 @@ class Robot extends Command
         $id = $this->argument('id');
 
         while (true) {
-            $robotList = RobotModel::where('id','>',0)->get();
-            foreach($robotList as $robot){
-                if ($robot->status == RobotModel::STOP) {
+
+            //设置行情
+            $robot = RobotModel::find($id);
+//            $robotPlan = RobotPlan::where('rid', $id)->where('itime', '<=', time())->orderBy('itime', 'desc')->get();
+//            if ($robotPlan) {
+//                $_robotPlan = $robotPlan[0];
+//
+//                $robot->float_number_down = $_robotPlan->float_down;
+//                $robot->float_number_up = $_robotPlan->float_up;
+//                $robot->save();
+//                $currency_match = CurrencyMatch::where('currency_id', $robot->currency_id)->where('legal_id', $robot->legal_id)->get();
+//                $currency_match = $currency_match[0];
+//                $currency_match->fluctuate_min = $_robotPlan->min_price;
+//                $currency_match->fluctuate_max = $_robotPlan->max_price;
+//                $currency_match->save();
+//            }
+
+            $robot = RobotModel::find($id);
+
+            if (!$robot) {
+                $this->info('找不到此机器人');
+                break;
+            }
+
+            if ($robot->status == RobotModel::STOP) {
                 $this->info('机器人已关闭');
                 break;
             }
@@ -70,39 +95,18 @@ class Robot extends Command
 
             try {
                 if ($robot->sell == RobotModel::OPEN) {
-                    $this->info('开始卖出');
+                    $this->info('模拟Sell数据');
                     $this->sell($robot, $robot->number_max, $robot->number_min);
                 }
+
                 if ($robot->buy == RobotModel::OPEN) {
-                    $this->info('开始买入');
-                    $this->buy($robot, $robot->number_max, $robot->number_min);
+                    $this->info('模拟Buy数据');
+                    //$this->buy($robot, $robot->number_max, $robot->number_min);
                 }
             } catch (\Exception $e) {
                 $this->info($e->getMessage());
             }
-            $complete = TransactionComplete::orderBy('id', 'desc')
-                ->where("currency", $robot->currency_id)
-                ->where("legal", $robot->legal_id)
-                ->take(20)
-                ->get();
-
-            $send = array(
-                "type" => "deal_list",
-                "currency_id" => $robot->currency_id,
-                "legal_id" => $robot->legal_id,
-                "complete" => $complete,
-            );
-            echo '开始发送';
-            UserChat::sendChat($send);
-            }
-            $robot = RobotModel::find($id);
-
-            // if (!$robot) {
-            //     $this->info('找不到此机器人');
-            //     break;
-            // }
-
-            
+            $this->info('睡眠时间：' . $robot->second);
             sleep($robot->second);
         }
 
@@ -112,151 +116,468 @@ class Robot extends Command
 
     protected function sell($robot, $number_max, $number_min)
     {
+        $this->SaveQuotation($robot);
+
         //随机数量
-        $num          = $this->getNumber($number_min, $number_max);
+        $num = $this->getNumber($number_min, $number_max);
         $total_number = $num;
 
         //随机价格
         $price = $this->getPrice(strtolower($robot->currency_info . $robot->legal_info), $robot->float_number_down, $robot->float_number_up);
+//        var_dump($price);
+        $faker = Factory::create();
+        $now_price = $price['close'];
+        $currency_name = strtolower($robot->currency_info . 'usdt');
+        $key = "market.{$currency_name}.kline.1min";
 
-        $user = Users::find($robot->sell_user_id);
-
-        $in = TransactionIn::where("price", ">=", $price)
-            ->where("currency", $robot->currency_id)
-            ->where("legal", $robot->legal_id)
-            ->where("number", ">", "0")
-            ->orderBy('price', 'desc')
-            ->get();
-
-        $user_currency = UsersWallet::where("user_id", $robot->sell_user_id)
-            ->where("currency", $robot->currency_id)
-            ->first();
-
-        $has_num = 0;
-        if (!empty($in)) {
-            foreach ($in as $i) {
-                if ($has_num >= $num) break;
-
-                $shengyu_num = $num - $has_num;
-                $this_num    = $i->number > $shengyu_num ? $this_num = $shengyu_num : $this_num = $i->number;
-                $has_num     = $has_num + $this_num;
-
-                if ($this_num > 0) {
-                    TransactionOut::transaction($i, $this_num, $user, $user_currency, $robot->legal_id, $robot->currency_id);
-                }
-            }
-            // Transaction::newDealList($robot->legal_id, $robot->currency_id);
+        if (time() % 60 < 50 && time() % 60 > 10) {
+            $now_price = $faker->randomFloat(6, $price['low'], $price['high']);
         }
+        $hh = json_encode(['ch' => $key, 'ts' => self::getNowTime(), 'tick' => [
+            'id' => self::getNowTime() / 1000,
+            'open' => $price['open'],
+            'close' => $now_price,
+            'low' => $price['low'],
+            'high' => $price['high'],
+            'vol' => $price['vol'],
+            'amount' => $price['vol'],
+            'count' => rand($robot->number_min, $robot->number_max)
+        ]]);
+        Redis::set($key, $hh);
+        
+        $this->sendDepthAndDetail($robot->currency_info, $robot);
 
-        $num = $num;//$num - $has_num;
-        if ($num > 0) {
-            $out               = new TransactionOut();
-            $out->user_id      = $robot->sell_user_id;
-            $out->price        = $price;
-            $out->number       = $num;
-            $out->total_number = $total_number;
-            $out->currency     = $robot->currency_id;
-            $out->legal        = $robot->legal_id;
-            $out->create_time  = time();
+        $this->info('模拟五分钟K线');
+        $key = "market.{$currency_name}.kline.5min";
+        $stamp = Robot::getNowTime('5min') / 1000;
+        $_id = "market." . strtolower($currency_name) . ".kline.{$stamp}";
+        $price = $this->getESData($_id, '5min');
+        $now_price = $faker->randomFloat(6, $price['low'], $price['high']);
+        $hh = json_encode(['ch' => $key, 'ts' => self::getNowTime(), 'tick' => [
+            'id' => self::getNowTime('5min') / 1000,
+            'open' => $price['open'],
+            'close' => $now_price,
+            'low' => $price['low'],
+            'high' => $price['high'],
+            'vol' => $price['vol'],
+            'amount' => $price['vol'],
+            'count' => rand($robot->number_min, $robot->number_max)
+        ]]);
+        Redis::set($key, $hh);
+        
+        $this->info('模拟15分钟K线');
+        $key = "market.{$currency_name}.kline.15min";
+        $stamp = Robot::getNowTime('15min') / 1000;
+        $_id = "market." . strtolower($currency_name) . ".kline.{$stamp}";
+        $price = $this->getESData($_id, '15min');
+        $now_price = $faker->randomFloat(6, $price['low'], $price['high']);
+        $hh = json_encode(['ch' => $key, 'ts' => self::getNowTime(), 'tick' => [
+            'id' => self::getNowTime('15min') / 1000,
+            'open' => $price['open'],
+            'close' => $now_price,
+            'low' => $price['low'],
+            'high' => $price['high'],
+            'vol' => $price['vol'],
+            'amount' => $price['vol'],
+            'count' => rand($robot->number_min, $robot->number_max)
+        ]]);
+        Redis::set($key, $hh);
 
-            $out->save();
+        $this->info('模拟30分钟K线');
+        $key = "market.{$currency_name}.kline.30min";
+        $stamp = Robot::getNowTime('30min') / 1000;
+        $_id = "market." . strtolower($currency_name) . ".kline.{$stamp}";
+        $price = $this->getESData($_id, '30min');
+        $now_price = $faker->randomFloat(6, $price['low'], $price['high']);
+        $hh = json_encode(['ch' => $key, 'ts' => self::getNowTime(), 'tick' => [
+            'id' => self::getNowTime('30min') / 1000,
+            'open' => $price['open'],
+            'close' => $now_price,
+            'low' => $price['low'],
+            'high' => $price['high'],
+            'vol' => $price['vol'],
+            'amount' => $price['vol'],
+            'count' => rand($robot->number_min, $robot->number_max)
+        ]]);
+        Redis::set($key, $hh);
 
-            // $user_currency->change_balance      = $user_currency->change_balance - $num;
-            // $user_currency->lock_change_balance = $user_currency->lock_change_balance + $num;
-            // $user_currency->save();
+        $this->info('模拟60分钟K线');
+        $key = "market.{$currency_name}.kline.60min";
+        $stamp = Robot::getNowTime('60min') / 1000;
+        $_id = "market." . strtolower($currency_name) . ".kline.{$stamp}";
+        $price = $this->getESData($_id, '60min');
+        $now_price = $faker->randomFloat(6, $price['low'], $price['high']);
+        $hh = json_encode(['ch' => $key, 'ts' => self::getNowTime(), 'tick' => [
+            'id' => self::getNowTime('60min') / 1000,
+            'open' => $price['open'],
+            'close' => $now_price,
+            'low' => $price['low'],
+            'high' => $price['high'],
+            'vol' => $price['vol'],
+            'amount' => $price['vol'],
+            'count' => rand($robot->number_min, $robot->number_max)
+        ]]);
+        Redis::set($key, $hh);
 
-            AccountLog::insertLog([
-                'user_id' => $robot->sell_user_id,
-                'value'   => -$num,
-                'info'    => "提交卖出记录扣除",
-                'type'    => AccountLog::TRANSACTIONOUT_SUBMIT_REDUCE
-            ]);
-        }
+        $this->info('模拟天K线');
+        $key = "market.{$currency_name}.kline.1day";
+        $stamp = Robot::getNowTime('1day') / 1000;
+        $_id = "market." . strtolower($currency_name) . ".kline.{$stamp}";
+        $price = $this->getESData($_id, '1day');
+        $now_price = $faker->randomFloat(6, $price['close'] - $robot->float_number_down, $price['close'] + $robot->float_number_up);
+        $hh = json_encode(['ch' => $key, 'ts' => self::getNowTime(), 'tick' => [
+            'id' => self::getNowTime('1day') / 1000,
+            'open' => $price['open'],
+            'close' => $now_price,
+            'low' => $price['low'],
+            'high' => $price['high'],
+            'vol' => $price['vol'],
+            'amount' => $price['vol'],
+            'count' => rand($robot->number_min, $robot->number_max)
+        ]]);
+        Redis::set($key, $hh);
 
-        Transaction::pushNews($robot->currency_id, $robot->legal_id);
+        $this->info('模拟周分钟K线');
+        $key = "market.{$currency_name}.kline.1week";
+        $stamp = Robot::getNowTime('1week') / 1000;
+        $_id = "market." . strtolower($currency_name) . ".kline.{$stamp}";
+        $price = $this->getESData($_id, '1week');
+        $now_price = $faker->randomFloat(6, $price['low'], $price['high']);
+        $hh = json_encode(['ch' => $key, 'ts' => self::getNowTime(), 'tick' => [
+            'id' => self::getNowTime('1week') / 1000,
+            'open' => $price['open'],
+            'close' => $now_price,
+            'low' => $price['low'],
+            'high' => $price['high'],
+            'vol' => $price['vol'],
+            'amount' => $price['vol'],
+            'count' => rand($robot->number_min, $robot->number_max)
+        ]]);
+        Redis::set($key, $hh);
+
+        $this->info('模拟月线');
+        $key = "market.{$currency_name}.kline.1mon";
+        $stamp = Robot::getNowTime('1mon') / 1000;
+        $_id = "market." . strtolower($currency_name) . ".kline.{$stamp}";
+        $price = $this->getESData($_id, '1mon');
+        $now_price = $faker->randomFloat(6, $price['low'], $price['high']);
+        $hh = json_encode(['ch' => $key, 'ts' => self::getNowTime(), 'tick' => [
+            'id' => self::getNowTime('1week') / 1000,
+            'open' => $price['open'],
+            'close' => $now_price,
+            'low' => $price['low'],
+            'high' => $price['high'],
+            'vol' => $price['vol'],
+            'amount' => $price['vol'],
+            'count' => rand($robot->number_min, $robot->number_max)
+        ]]);
+        Redis::set($key, $hh);
+
     }
 
-    protected function buy($robot, $number_max, $number_min)
+    public function getESData($id, $peroid)
     {
-        //随机数量
-        $num          = $this->getNumber($number_min, $number_max);
-        $total_number = $num;
 
-        //随机价格
-        $price = $this->getPrice(strtolower($robot->currency_info.$robot->legal_info), $robot->float_number_down, $robot->float_number_up);
-
-        $user = Users::find($robot->buy_user_id);
-
-        $has_num = 0;
-
-        $user_legal = UsersWallet::where("user_id", $robot->buy_user_id)->where("currency", $robot->legal_id)->first();
-
-        $out = TransactionOut::where("price", "<=", $price)
-            ->where("number", ">", "0")
-            ->where("currency", $robot->currency_id)
-            ->where("legal", $robot->legal_id)
-            ->orderBy('price', 'asc')
-            ->get();
-
-        if (!empty($out)) {
-
-            foreach ($out as $o) {
-                if ($has_num < $num) {
-                    $shengyu_num = $num - $has_num;
-                    $this_num    = 0;
-                    if ($o->number > $shengyu_num) {
-                        $this_num = $shengyu_num;
-                    } else {
-                        $this_num = $o->number;
-                    }
-                    $has_num = $has_num + $this_num;
-                    
-                    if ($this_num > 0) {
-                        // echo 333;
-                        TransactionIn::transaction($o, $this_num, $user, $robot->legal_id, $robot->currency_id);
-                    }
-                } else {
-                    break;
-                }
-            }
-            // Transaction::newDealList($robot->legal_id, $robot->currency_id);
-        }else{
-            echo 'empty out';
+        $esclient = MarketHour::getEsearchClient();
+        $params = [
+            'index' => 'market.kline.' . $peroid,
+           // 'index' => 'market.kline',
+            'type' => 'doc',
+            'id' => $id
+        ];
+        //var_dump($params);
+        try{
+            $res = $esclient->get($params);
+            $this->info($res);
+            return $res['_source'];
+        } catch (\Exception $e) {
+            $this->info($e->getMessage());
         }
- 
-        $num = $num ;//- $has_num;
-       
-        if ($num > 0) {
-            $in               = new TransactionIn();
-            $in->user_id      = $robot->buy_user_id;
-            $in->price        = $price;
-            $in->number       = $num;
-            $in->currency     = $robot->currency_id;
-            $in->legal        = $robot->legal_id;
-            $in->total_number = $total_number;
-            $in->create_time  = time();
+    }
 
-            $in->save();
+    //保持交易单数据
+    public function SaveQuotation($robot)
+    {
+        $currency_match = CurrencyMatch::where('currency_id', $robot->currency_id)->where('legal_id', $robot->legal_id)->get();
+        $currency_match = $currency_match[0]->toArray();
 
-            $all_balance                    = $price * $num;
-            // $user_legal->legal_balance      = $user_legal->legal_balance - $all_balance;
-            // $user_legal->lock_legal_balance = $user_legal->lock_legal_balance + $all_balance;
-            // $user_legal->save();
+        $time = self::getNowTime();
+        $last_time = strtotime('-1 min', $time / 1000);
+        $esclient = MarketHour::getEsearchClient();
 
-            AccountLog::insertLog([
-                'user_id' => $robot->buy_user_id,
-                'value'   => -$all_balance,
-                'info'    => "提交卖入记录扣除",
-                'type'    => AccountLog::TRANSACTIONIN_SUBMIT_REDUCE
+        $last_id = strtolower($robot->currency_info . $robot->legal_info) . '.1min.' . ($last_time * 1000);
+        $id = strtolower($robot->currency_info . $robot->legal_info) . '.1min.' . ($time);
+
+        $last_info = $this->getESDataQuotation($last_id);
+        $info = $this->getESDataQuotation($id);
+
+        $huobi_info = $this->getPriceHuobi($robot);
+       // var_dump($huobi_info);
+        $faker = Factory::create();
+        $needle = [];
+        $needle['open'] = floatval($last_info ? $last_info['close'] : $huobi_info['open']);
+        if ($last_info) {
+
+            $needle['close'] = $huobi_info['close'];
+            $max = max($huobi_info['high'], $huobi_info['open'], $needle['close'],$needle['open']);
+            $min = min($huobi_info['low'], $huobi_info['close'], $needle['open'],$needle['close']);
+            $needle['high'] =  floatval($faker->randomFloat(6, $max, $max + $robot->float_number_up));
+            $needle['low'] = floatval($faker->randomFloat(6, $min-$robot->float_number_down, $min));
+
+        } else {
+            $needle['high'] = floatval($huobi_info['high']);
+            $needle['low'] = floatval($huobi_info['low']);
+            $needle['close'] = floatval($huobi_info['close']);
+        }
+
+
+        $needle['vol'] = floatval(sprintf('%.2f', $faker->randomFloat(2, $robot->number_min, $robot->number_max) * 20));
+        $needle['base'] = $robot->currency_info;
+        $needle['target'] = $robot->legal_info;
+        $needle['symbol'] = "{$robot->currency_info}/{$robot->legal_info}";
+        $needle['itime'] = $time / 1000;
+
+
+        $params = [
+            'index' => 'market.quotation',
+            'type' => 'doc',
+            'id' => $id,
+            'body' => json_encode($needle)
+        ];
+
+        try{
+            $esclient->delete([
+                'index' => 'market.quotation',
+                'type' => 'doc',
+                'id' => $id
             ]);
+        }catch (\Exception $e)
+        {
+            $this->info($e);
         }
-//        Transaction::pushNews($robot->currency_id, $robot->legal_id);
+        //var_dump($params);
+        $res = $esclient->index($params);
+
+        
+
+        $kline_data = [
+            'type' => 'kline',
+            'period' => "1min",
+            'match_id' => "14",
+            'currency_id' => $robot->currency_id,
+            'currency_name' => $robot->currency_info,
+            'legal_id' => $robot->legal_id,
+            'legal_name' => $robot->legal_info,
+            'open' => $needle['open'],
+            'close' => $needle['close'],
+            'low' => $needle['low'],
+            'high' => $needle['high'],
+            'symbol' => $robot->currency_info . '/' . $robot->legal_info,
+            'volume' => sctonum($needle['vol']),
+            'time' => $time,
+        ];
+
+        //xhd add 
+        //推送币种的日行情(带涨副)
+        $change = $this->calcIncreasePair($kline_data ?? []);
+        bc_comp($change, 0) > 0 && $change = '+' . $change;
 
 
+         //追加涨副等信息
+         $inc_data = [
+            'change' => $change,
+            'now_price' => $needle['close'],
+            'api_form' => 'robot',
+        ];
+        $kline_data = array_merge($kline_data, $inc_data);
+        var_dump($kline_data);
+        //k先不能直接这样，，需要去去完整的一分钟行情， 而更新下面当前价是用于跳起来
+       SendMarket::dispatch($kline_data)->onQueue('kline.all');
+       //下面这个还要看下 是上面
+       // UpdateCurrencyPrice::dispatch($kline_data)->onQueue('update_currency_price');
+       UpdateCurrencyPrice::dispatch($kline_data)->onQueue('update_currency_price');
+   
+    }
+
+    //计算涨幅等信息
+    protected function calcIncreasePair($kline_data)
+    {
+        $open = $kline_data['open'];
+        $close = $kline_data['close'];;
+        $change_value = bc_sub($close, $open);
+        $change = bc_mul(bc_div($change_value, $open), 100, 2);
+        return $change;
+    }
+
+    //获取货币价格
+    public function getPriceHuobi($robot)
+    {
+        //获取最新价格
+
+        $symbol = strtolower($robot->huobi_currency . 'usdt');
+        $url = "https://api.huobi.pro/market/history/kline?symbol={$symbol}&period=1min&size=1";
+        $con = json_decode(file_get_contents($url), true);
+
+        //查看有没有当前区间的plan
+        $time = time();
+        $robotPlan = RobotPlan::where('itime', '<=', $time)->where('etime', '>', $time)->orderBy('itime','desc')->get();
+//        var_dump(count($robotPlan));
+        if (count($robotPlan) > 0) {
+            $_robotPlan = $robotPlan[0];
+        }
+        if (is_array($con)) {
+            $obj = $con['data'][0];
+            if (isset($_robotPlan)) {
+//                var_dump($_robotPlan);
+                $obj['open'] = floatval(sprintf('%.6f', $obj['open'] * $robot['mult'] * (1+$_robotPlan->float_up)));
+                $obj['high'] = floatval(sprintf('%.6f', $obj['high'] * $robot['mult'] *(1+$_robotPlan->float_up)));
+                $obj['low'] = floatval(sprintf('%.6f', $obj['low'] * $robot['mult'] *(1+$_robotPlan->float_up)));
+                $obj['close'] = floatval(sprintf('%.6f', $obj['close'] * $robot['mult'] *(1+$_robotPlan->float_up)));
+            } else {
+                $obj['open'] = floatval(sprintf('%.6f', $obj['open'] * $robot['mult']));
+                $obj['high'] = floatval(sprintf('%.6f', $obj['high'] * $robot['mult']));
+                $obj['low'] = floatval(sprintf('%.6f', $obj['low'] * $robot['mult']));
+                $obj['close'] = floatval(sprintf('%.6f', $obj['close'] * $robot['mult']));
+            }
+
+            return $obj;
+        }else{
+            return false;
+        }
+    }
+
+    //获取订单数据
+    public function getESDataQuotation($id)
+    {
+        try {
+            $esclient = MarketHour::getEsearchClient();
+            $params = [
+                'index' => 'market.quotation',
+                'type' => 'doc',
+                'id' => $id,
+            ];
+
+            $res = $esclient->get($params);
+//            var_dump('在里面查到的',$res);
+            return $res['_source'];
+        } catch (\Exception $ex) {
+            return false;
+        }
+    }
+
+    //发送盘口与交易数据
+    public function sendDepthAndDetail($currency, $robot)
+    {
+        
+        $currency = strtolower($currency);
+        $currency_id = Currency::where('name', strtoupper($currency))->first();
+        $rkey = "market.{$currency}usdt.kline.1min";
+        $obj = json_decode(Redis::get($rkey));
+
+        if (!$obj) {
+            return;
+        }
+
+        $price = $obj->tick->close;
+
+        $bids = [];
+        $asks = [];
+
+        $faker = Factory::create();
+        for ($i = 0; $i < 10; $i++) {
+            $bids[] = [$faker->randomFloat(4, $price - $robot->float_number_down, $price), $faker->randomFloat(2, $robot->number_min, $robot->number_max)];
+        }
+        for ($i = 0; $i < 10; $i++) {
+            $asks[] = [$faker->randomFloat(4, $price, $price + $robot->float_number_down), $faker->randomFloat(2, $robot->number_min, $robot->number_max)];
+        }
+
+        $depth_data = [
+            'type' => 'market_depth',
+            'symbol' => strtoupper($currency) . '/USDT',
+            'base-currency' => $currency_id->name,
+            'quote-currency' => 'USDT',
+            'currency_id' => $currency_id->id,
+            'currency_name' => $currency_id->name,
+            'legal_id' => 3,
+            'legal_name' => 'USDT',
+            'bids' => $bids, //买入盘口
+            'asks' => $asks, //卖出盘口
+        ];
+
+        $infos = [];
+        for ($i = 0; $i < rand(0, 30); $i++) {
+            $way = rand(1, 10) % 2 === 0 ? 'buy' : 'sell';
+            $obj = [
+                "amount" => $faker->randomFloat(2, $robot->number_min, $robot->number_max),
+                "ts" => intval(microtime(true) * 1000), //trade time
+                "id" => time(),
+                "time" => date('H:i:s'),
+                "tradeId" => microtime(true),
+                "price" => $price,
+                "direction" => $way
+            ];
+            $infos[] = $obj;
+        }
+
+        $yeah = strtoupper($currency);
+        $detail_data = [
+            'type' => 'market_detail',
+            'symbol' => $yeah . '/USDT',
+            'base-currency' => $yeah,
+            'quote-currency' => 'USDT',
+            'currency_id' => $currency_id->id,
+            'currency_name' => $yeah,
+            'legal_id' => 3,
+            'legal_name' => 'USDT',
+            'data' => $infos, //卖出盘口
+        ];;
+      
+       //var_dump($depth_data);
+        //var_dump($detail_data);
+        //盘口信息
+        SendMarket::dispatch($depth_data)->onQueue('market.depth');
+        //全站交易信息
+        SendMarket::dispatch($detail_data)->onQueue('market.detail');
     }
 
 
-    /**获取火币行情价格
+    /**
+     * 获取整数时间
+     */
+    public static function getNowTime($type = '1min', $time = null)
+    {
+        $current = is_null($time) ? time() : $time;
+
+        $yl = 60;
+        if ($type == '5min') {
+            $yl = 300;
+        }
+        if ($type == '15min') {
+            $yl = 900;
+        }
+        if ($type == '30min') {
+            $yl = 1800;
+        }
+        if ($type == '60min') {
+            $yl = 3600;
+        }
+
+        $stamp = ($current % $yl) > 0 ? ($current - $current % $yl) : $current;
+
+        if ($type == '1day') {
+            $stamp = strtotime(date('Y-m-d', $current));
+        }
+        if ($type == '1week') {
+            $stamp = strtotime('next Sunday', $current) - 60 * 60 * 24 * 7;
+        }
+        if ($type == '1mon') {
+            $stamp = strtotime(date('Y-m', $current) . '-01');
+        }
+        return $stamp * 1000;
+    }
+
+
+    /**获取当前价格
      *
      * @param $symbol
      * @param $float_number_down
@@ -266,14 +587,18 @@ class Robot extends Command
      */
     public function getPrice($symbol, $float_number_down, $float_number_up)
     {
-        $url   = 'https://api.huobi.br.com/market/trade?symbol=' . $symbol;
-        $info  = $this->curl($url);
-        $price = $info['tick']['data'][0]['price'];
+        $this->info('交易对是：' . $symbol);
+        $eclient = MarketHour::getEsearchClient();
+        $type = $symbol . '.1min';
+        $params = [
+            'index' => 'market.quotation',
+            'type' => 'doc',
+            'id' => $type . '.' . self::getNowTime(),
+        ];
 
-        $faker = Factory::create();
-        $price = $faker->randomFloat(2, $price - $float_number_down, $price + $float_number_up);
-        unset($faker);
-        return $price;
+        $result = $eclient->get($params);
+//        var_dump($result);
+        return $result['_source'];
     }
 
     /**获取买入卖出随机数
@@ -286,31 +611,9 @@ class Robot extends Command
     public function getNumber($number_min, $number_max)
     {
         $faker = Factory::create();
-        $num   = $faker->randomFloat(2, $number_min, $number_max);
+        $num = $faker->randomFloat(2, $number_min, $number_max);
         unset($faker);
         return $num;
     }
 
-    public function curl($url, $type = 'GET', $postdata = [])
-    {
-        $ch = curl_init();
-        curl_setopt($ch, CURLOPT_URL, $url);
-        if ($type == 'POST') {
-            curl_setopt($ch, CURLOPT_POST, 1);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($postdata));
-        }
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
-        curl_setopt($ch, CURLOPT_HEADER, 0);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 60);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, [
-            "Content-Type: application/json",
-        ]);
-        curl_setopt($ch, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
-        $output = curl_exec($ch);
-        $info   = curl_getinfo($ch);
-        curl_close($ch);
-        return @json_decode($output, true);
-    }
 }
